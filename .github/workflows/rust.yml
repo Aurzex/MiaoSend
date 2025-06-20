@@ -1,22 +1,77 @@
-name: Rust
+name: Windows Build and Release
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  release:
+    types: [created]
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: miao-send
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Get version
+      id: version
+      run: echo "version=$(grep '^version' Cargo.toml | cut -d '"' -f2)" >> $GITHUB_OUTPUT
+      
+    - name: Install Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: rust-src, clippy, rustfmt
+        
+    - name: Build release binary
       run: cargo build --verbose --release
+      
     - name: Run tests
       run: cargo test --verbose
+      
+    - name: Create release directory
+      run: mkdir release
+      
+    - name: Copy binary to release directory
+      run: Copy-Item "target/release/$env:BINARY_NAME.exe" -Destination release/
+      
+    - name: Setup Chocolatey
+      uses: crazy-max/ghaction-chocolatey@v3
+      with:
+        args: install chocolatey
+      
+    - name: Install 7-Zip
+      run: choco install 7zip -y
+      
+    - name: Create release archives
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        cd release
+        7z a "$env:BINARY_NAME-windows-x64-$env:VERSION.7z" "$env:BINARY_NAME.exe"
+        7z a "$env:BINARY_NAME-windows-x64-$env:VERSION.zip" "$env:BINARY_NAME.exe"
+      
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-release
+        path: release/*.7z
+        retention-days: 5
+        
+    - name: Create GitHub Release
+      if: ${{ github.event_name == 'release' }}
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release/*.7z
+          release/*.zip
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
