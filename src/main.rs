@@ -2,7 +2,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
-use reqwest::{Client, multipart};
+use reqwest::{Client, multipart,header};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
