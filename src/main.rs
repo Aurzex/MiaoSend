@@ -137,9 +137,31 @@ struct FileUploader {
 
 impl FileUploader {
     fn new() -> Result<Self, UploadError> {
+        // 创建默认请求头
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        headers.insert(
+            header::ACCEPT_LANGUAGE,
+            header::HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json;charset=UTF-8"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"),
+        );
+
+        // 构建带有默认头的客户端
         let client = Client::builder()
+            .default_headers(headers) // 添加这行设置默认头
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECONDS))
             .build()?;
+            
         let config = Self::load_config()?;
         Ok(FileUploader { client, config })
     }
