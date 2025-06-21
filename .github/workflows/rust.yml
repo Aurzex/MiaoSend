@@ -44,9 +44,6 @@ jobs:
     - name: Copy binary to release directory
       run: Copy-Item "target/release/${{ steps.package.outputs.name }}.exe" -Destination release/
       
-    - name: Setup Chocolatey
-      uses: crazy-max/ghaction-chocolatey@v3
-      
     - name: Install 7-Zip
       run: choco install 7zip -y
       
