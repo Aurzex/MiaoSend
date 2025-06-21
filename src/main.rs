@@ -1,8 +1,7 @@
 use chrono::Local;
 use clap::{Parser, Subcommand};
-
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
-use reqwest::{Client, multipart,header};
+use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -12,6 +11,7 @@ use std::{
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
+use futures_util::StreamExt;
 
 const CHUNK_SIZE: u64 = 40 * 1024 * 1024; // 40MB
 const HISTORY_FILE: &str = "upload_history.json";
@@ -98,7 +98,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Login to the service
+    /// Login to Codemao service
     Login {
         #[clap(short, long)]
         identity: String,
@@ -137,31 +137,9 @@ struct FileUploader {
 
 impl FileUploader {
     fn new() -> Result<Self, UploadError> {
-        // 创建默认请求头
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            header::HeaderValue::from_static("gzip, deflate, br, zstd"),
-        );
-        headers.insert(
-            header::ACCEPT_LANGUAGE,
-            header::HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"),
-        );
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json;charset=UTF-8"),
-        );
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"),
-        );
-
-        // 构建带有默认头的客户端
         let client = Client::builder()
-            .default_headers(headers) // 添加这行设置默认头
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECONDS))
             .build()?;
-            
         let config = Self::load_config()?;
         Ok(FileUploader { client, config })
     }
@@ -202,31 +180,58 @@ impl FileUploader {
     }
 
     async fn login(&mut self, identity: &str, password: &str) -> Result<(), UploadError> {
+        let pid = "65edCTyg";
+        println!("Logging in with identity: {}, pid: {}", identity, pid);
+        
         let response = self
             .client
             .post("https://api.codemao.cn/tiger/v3/web/accounts/login")
             .json(&serde_json::json!({
                 "identity": identity,
                 "password": password,
-                "pid": "65edCTyg"
+                "pid": pid,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                println!("Request error: {:?}", e);
+                UploadError::ReqwestError(e)
+            })?;
 
-        if !response.status().is_success() {
+        // 先读取响应文本
+        let status = response.status();
+        let text = response.text().await.map_err(|e| {
+            println!("Error reading response text: {:?}", e);
+            UploadError::ReqwestError(e)
+        })?;
+
+        println!("Login response status: {}, content: {}", status, text);
+
+        if !status.is_success() {
             return Err(UploadError::AuthError(format!(
-                "Login failed with status: {}",
-                response.status()
+                "Login failed with status: {}\nResponse: {}",
+                status, text
             )));
         }
 
-        let json: serde_json::Value = response.json().await?;
+        // 解析响应获取token
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            println!("JSON parse error: {:?}, content: {}", e, text);
+            UploadError::SerdeError(e)
+        })?;
+        
+        println!("Parsed JSON: {:?}", json);
+
         if let Some(token) = json["auth"]["token"].as_str() {
+            println!("Login successful! Token: {}", token);
             self.config.auth_token = Some(token.to_string());
             self.save_config()?;
             Ok(())
         } else {
-            Err(UploadError::AuthError("No token in response".to_string()))
+            Err(UploadError::AuthError(format!(
+                "No token in response: {}",
+                text
+            )))
         }
     }
 
@@ -235,19 +240,61 @@ impl FileUploader {
         file_path: &Path,
         save_path: &str,
     ) -> Result<Vec<String>, UploadError> {
-        if self.config.auth_token.is_none() {
-            return Err(UploadError::AuthError("Not logged in".to_string()));
-        }
-
         let file_size = fs::metadata(file_path)?.len();
 
         if file_size <= CHUNK_SIZE {
-            let url = self.upload_via_pgaot(file_path, save_path).await?;
+            let url = self.upload_to_pgaot(file_path, save_path).await?;
             Ok(vec![url])
         } else {
             let chunks = self.split_and_upload(file_path, save_path).await?;
             Ok(chunks)
         }
+    }
+
+    async fn upload_to_pgaot(
+        &self,
+        file_path: &Path,
+        save_path: &str,
+    ) -> Result<String, UploadError> {
+        let file_bytes = std::fs::read(file_path)?;
+        let file_name = file_path.file_name().unwrap().to_str().unwrap();
+
+        let form = multipart::Form::new()
+            .text("path", save_path.to_string())
+            .part(
+                "file",
+                multipart::Part::bytes(file_bytes)
+                    .file_name(file_name.to_string())
+                    .mime_str("application/octet-stream")?,
+            );
+
+        let response = self
+            .client
+            .post("https://api.pgaot.com/user/up_cat_file")
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(UploadError::Other(format!(
+                "Upload failed with status: {}\n{}",
+                status,
+                error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct PgaotUploadResponse {
+            url: String,
+        }
+
+        let response_json: PgaotUploadResponse = response.json().await?;
+        Ok(response_json.url)
     }
 
     async fn split_and_upload(
@@ -269,7 +316,7 @@ impl FileUploader {
 
         let mut urls = Vec::new();
         for chunk in &chunk_paths {
-            let url = self.upload_via_pgaot(chunk, save_path).await?;
+            let url = self.upload_to_pgaot(chunk, save_path).await?;
             urls.push(url);
             pb.inc(1);
         }
@@ -298,14 +345,14 @@ impl FileUploader {
     ) -> Result<Vec<PathBuf>, UploadError> {
         Self::check_7z_exists()?;
 
-        let file_name = file_path.file_stem().unwrap().to_str().unwrap();
+        let file_stem = file_path.file_stem().unwrap().to_str().unwrap();
 
-        let output_path = output_dir.join(format!("{}.7z", file_name));
+        let output_path = output_dir.join(format!("{}.7z", file_stem));
 
         let status = std::process::Command::new("7z")
             .arg("a")
             .arg(format!("-v{}m", CHUNK_SIZE / (1024 * 1024)))
-            .arg("-mx0") // No compression
+            .arg("-mx0")
             .arg(&output_path)
             .arg(file_path)
             .status()
@@ -315,18 +362,18 @@ impl FileUploader {
             return Err(UploadError::SevenZipError("7z compression failed".into()));
         }
 
-        // Find all chunk files
+        // 查找所有分块文件
         let mut chunks = Vec::new();
         let mut part = 1;
 
         loop {
-            let chunk_name = format!("{}.7z.{:03}", file_name, part);
+            let chunk_name = format!("{}.7z.{:03}", file_stem, part);
             let chunk_path = output_dir.join(chunk_name);
 
             if !chunk_path.exists() {
                 if part == 1 {
-                    // Check if we have a single file (not split)
-                    let single_file = output_dir.join(format!("{}.7z", file_name));
+                    // 检查是否有单个文件（未分割）
+                    let single_file = output_dir.join(format!("{}.7z", file_stem));
                     if single_file.exists() {
                         chunks.push(single_file);
                     }
@@ -339,46 +386,6 @@ impl FileUploader {
         }
 
         Ok(chunks)
-    }
-
-    async fn upload_via_pgaot(
-        &self,
-        file_path: &Path,
-        save_path: &str,
-    ) -> Result<String, UploadError> {
-        let file_bytes = std::fs::read(file_path)?;
-        let file_name = file_path.file_name().unwrap().to_str().unwrap();
-
-        let form = multipart::Form::new()
-            .text("path", save_path.to_string())
-            .part(
-                "file",
-                multipart::Part::bytes(file_bytes)
-                    .file_name(file_name.to_string())
-                    .mime_str("application/octet-stream")?,
-            );
-
-        let response = self
-            .client
-            .post("https://api.pgaot.com/user/up_cat_file")
-            .multipart(form)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(UploadError::Other(format!(
-                "Upload failed with status: {}",
-                response.status()
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct UploadResponse {
-            url: String,
-        }
-
-        let response_json: UploadResponse = response.json().await?;
-        Ok(response_json.url)
     }
 
     async fn download_file(&self, url: &str, output_path: &str) -> Result<(), UploadError> {
@@ -400,9 +407,17 @@ impl FileUploader {
         );
 
         let mut file = tokio::fs::File::create(output_path).await?;
-        let stream = response.bytes().await?;
-        file.write_all(&stream).await?;
-        pb.inc(stream.len() as u64);
+        
+        // 使用更可靠的方式下载
+        let mut downloaded: u64 = 0;
+        let mut stream = response.bytes_stream();
+
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            pb.set_position(downloaded);
+        }
 
         pb.finish_with_message("Download completed");
         Ok(())
@@ -454,8 +469,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.command {
         Commands::Login { identity, password } => {
-            uploader.login(&identity, &password).await?;
-            println!("Login successful!");
+            match uploader.login(&identity, &password).await {
+                Ok(_) => println!("Login successful! Token saved."),
+                Err(e) => {
+                    eprintln!("Login failed: {}", e);
+                    if let UploadError::ReqwestError(ref reqwest_err) = e {
+                        eprintln!("Reqwest error details: {:?}", reqwest_err);
+                    }
+                    return Err(e.into());
+                }
+            }
         }
         Commands::Upload {
             file_path,
@@ -469,27 +492,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let file_size = fs::metadata(path)?.len();
             let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
 
-            println!("Uploading {} ({} bytes)...", file_name, file_size);
-            let urls = uploader.upload_file(path, &save_path).await?;
+            println!(
+                "Uploading {} ({} bytes) to save path: {}...",
+                file_name, file_size, save_path
+            );
 
-            println!("\nUpload successful! URLs:");
-            for url in &urls {
-                println!("- {}", url);
+            match uploader.upload_file(path, &save_path).await {
+                Ok(urls) => {
+                    println!("\nUpload successful! URLs:");
+                    for url in &urls {
+                        println!("- {}", url);
+                    }
+
+                    let record = UploadRecord {
+                        file_name,
+                        upload_time: Local::now().to_rfc3339(),
+                        urls,
+                        size: file_size,
+                        chunks: if file_size > CHUNK_SIZE {
+                            (file_size as f64 / CHUNK_SIZE as f64).ceil() as usize
+                        } else {
+                            1
+                        },
+                    };
+
+                    uploader.add_to_history(record)?;
+                }
+                Err(e) => {
+                    eprintln!("Upload failed: {}", e);
+                    return Err(e.into());
+                }
             }
-
-            let record = UploadRecord {
-                file_name,
-                upload_time: Local::now().to_rfc3339(),
-                urls,
-                size: file_size,
-                chunks: if file_size > CHUNK_SIZE {
-                    (file_size as f64 / CHUNK_SIZE as f64).ceil() as usize
-                } else {
-                    1
-                },
-            };
-
-            uploader.add_to_history(record)?;
         }
         Commands::Download { url, output_path } => {
             println!("Downloading from {} to {}...", url, output_path);

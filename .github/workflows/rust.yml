@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: miao-send
 
 jobs:
   build:
@@ -18,9 +17,14 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Get version
-      id: version
-      run: echo "version=$(grep '^version' Cargo.toml | cut -d '"' -f2)" >> $GITHUB_OUTPUT
+    - name: Get package metadata
+      id: package
+      shell: bash
+      run: |
+        name=$(grep '^name' Cargo.toml | cut -d '"' -f2)
+        version=$(grep '^version' Cargo.toml | cut -d '"' -f2)
+        echo "name=${name//-/_}" >> $GITHUB_OUTPUT
+        echo "version=$version" >> $GITHUB_OUTPUT
       
     - name: Install Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -38,23 +42,20 @@ jobs:
       run: mkdir release
       
     - name: Copy binary to release directory
-      run: Copy-Item "target/release/$env:BINARY_NAME.exe" -Destination release/
+      run: Copy-Item "target/release/${{ steps.package.outputs.name }}.exe" -Destination release/
       
     - name: Setup Chocolatey
       uses: crazy-max/ghaction-chocolatey@v3
-      with:
-        args: install chocolatey
       
     - name: Install 7-Zip
       run: choco install 7zip -y
       
     - name: Create release archives
-      env:
-        VERSION: ${{ steps.version.outputs.version }}
       run: |
+        $projectName = "${{ steps.package.outputs.name }}".Replace('_', '-')
         cd release
-        7z a "$env:BINARY_NAME-windows-x64-$env:VERSION.7z" "$env:BINARY_NAME.exe"
-        7z a "$env:BINARY_NAME-windows-x64-$env:VERSION.zip" "$env:BINARY_NAME.exe"
+        7z a "$projectName-windows-x64-${{ steps.package.outputs.version }}.7z" "${{ steps.package.outputs.name }}.exe"
+        7z a "$projectName-windows-x64-${{ steps.package.outputs.version }}.zip" "${{ steps.package.outputs.name }}.exe"
       
     - name: Upload release artifacts
       uses: actions/upload-artifact@v4
