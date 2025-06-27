@@ -8,10 +8,16 @@ use std::{
     fs::{self, File},
     io::{self},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use futures_util::StreamExt;
+use base64::{engine::general_purpose, Engine as _};
+use rand::Rng;
+use rand::distr::Alphanumeric;
+use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, generic_array::GenericArray}};
+
 
 const CHUNK_SIZE: u64 = 15 * 1024 * 1024; // 15MB
 const HISTORY_FILE: &str = "upload_history.json";
@@ -111,6 +117,8 @@ enum Commands {
         file_path: String,
         #[clap(short, long, default_value = "aumiao")]
         save_path: String,
+        #[clap(long)] // 新增选项：是否加密短文本
+        encrypt: bool,
     },
     /// Download a file
     Download {
@@ -128,6 +136,24 @@ enum Commands {
     },
     /// Show upload history
     History,
+    /// Download from short text
+    DownloadFromText {
+        #[clap(short, long)]
+        text: String,
+        #[clap(short, long)] // 解密密码（如果有）
+        password: Option<String>,
+        #[clap(short, long)]
+        output_path: String,
+    },
+}
+
+// 短文本数据结构
+#[derive(Serialize, Deserialize)]
+struct ShortTextData {
+    urls: Vec<String>,
+    original_file_name: String,
+    chunk_count: usize,
+    encrypted: bool,
 }
 
 struct FileUploader {
@@ -368,12 +394,15 @@ impl FileUploader {
     }
 
     fn check_7z_exists() -> Result<(), UploadError> {
-        let status = std::process::Command::new("7z")
+        // 使用更可靠的方式检查7z是否存在，避免输出多余信息
+        let output = Command::new("7z")
             .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map_err(|_| UploadError::SevenZipError("7z not found in PATH".into()))?;
 
-        if status.success() {
+        if output.success() {
             Ok(())
         } else {
             Err(UploadError::SevenZipError("7z command failed".into()))
@@ -391,16 +420,19 @@ impl FileUploader {
 
         let output_path = output_dir.join(format!("{}.7z", file_stem));
 
-        let status = std::process::Command::new("7z")
+        // 使用更可靠的方式调用7z，避免输出多余信息
+        let output = Command::new("7z")
             .arg("a")
             .arg(format!("-v{}m", CHUNK_SIZE / (1024 * 1024)))
             .arg("-mx0")
             .arg(&output_path)
             .arg(file_path)
-            .status()
+            .stdout(Stdio::null()) // 重定向标准输出
+            .stderr(Stdio::null()) // 重定向错误输出
+            .output()
             .map_err(|e| UploadError::SevenZipError(format!("Failed to execute 7z: {}", e)))?;
 
-        if !status.success() {
+        if !output.status.success() {
             return Err(UploadError::SevenZipError("7z compression failed".into()));
         }
 
@@ -514,6 +546,143 @@ impl FileUploader {
 
         Ok(())
     }
+    
+    // 生成短文本（支持加密）
+    fn generate_short_text(urls: &[String], original_file_name: &str, encrypt: bool) -> Result<String, UploadError> {
+        let data = ShortTextData {
+            urls: urls.to_vec(),
+            original_file_name: original_file_name.to_string(),
+            chunk_count: urls.len(),
+            encrypted: encrypt,
+        };
+        
+        let json = serde_json::to_string(&data)?;
+        
+        if encrypt {
+            // 生成随机密码
+            let password: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            
+            // 加密数据
+            let encrypted_data = Self::encrypt_data(&json, &password)?;
+            
+            // 返回密码和加密后的数据（Base64编码）
+            Ok(format!("PASSWORD:{}|DATA:{}", password, encrypted_data))
+        } else {
+            // 直接返回Base64编码的数据
+            Ok(general_purpose::STANDARD.encode(json))
+        }
+    }
+    
+    // 从短文本下载文件
+    async fn download_from_short_text(&self, text: &str, password: Option<&str>, output_path: &str) -> Result<(), UploadError> {
+        let (data, password_used) = if text.starts_with("PASSWORD:") {
+            // 解析密码和加密数据
+            let parts: Vec<&str> = text.splitn(2, "|DATA:").collect();
+            if parts.len() != 2 {
+                return Err(UploadError::Other("Invalid short text format".into()));
+            }
+            
+            let password_part = parts[0].strip_prefix("PASSWORD:").ok_or_else(|| {
+                UploadError::Other("Missing password prefix".into())
+            })?;
+            
+            let encrypted_data = parts[1];
+            
+            // 使用提供的密码解密
+            let decrypted_data = Self::decrypt_data(encrypted_data, password.unwrap_or(password_part))?;
+            
+            (decrypted_data, true)
+        } else {
+            // 直接解码Base64数据
+            let decoded = general_purpose::STANDARD.decode(text)
+                .map_err(|e| UploadError::Other(format!("Base64 decode failed: {}", e)))?;
+            
+            (String::from_utf8(decoded)
+                .map_err(|e| UploadError::Other(format!("UTF8 conversion failed: {}", e)))?, false)
+        };
+        
+        // 解析JSON数据
+        let short_text_data: ShortTextData = serde_json::from_str(&data)?;
+        
+        if password_used && password.is_none() && short_text_data.encrypted {
+            return Err(UploadError::Other("Password is required for encrypted short text".into()));
+        }
+        
+        println!("Downloading {} chunks...", short_text_data.chunk_count);
+        
+        // 创建临时目录
+        let temp_dir = tempdir()?;
+        let mut chunk_paths = Vec::new();
+        
+        // 下载所有分块
+        for (i, url) in short_text_data.urls.iter().enumerate() {
+            let chunk_name = format!("chunk_{:03}", i + 1);
+            let chunk_path = temp_dir.path().join(&chunk_name);
+            
+            println!("Downloading chunk {}/{}...", i + 1, short_text_data.chunk_count);
+            self.download_file(url, &chunk_path.to_string_lossy()).await?;
+            
+            chunk_paths.push(chunk_path.to_string_lossy().into_owned());
+        }
+        
+        // 合并分块
+        println!("Merging chunks...");
+        FileUploader::merge_chunks(output_path, &chunk_paths)?;
+        
+        println!("Download and merge completed: {}", output_path);
+        Ok(())
+    }
+    
+    // 加密数据
+    fn encrypt_data(data: &str, password: &str) -> Result<String, UploadError> {
+        // 使用AES-GCM加密
+        let key = GenericArray::from_slice(password.as_bytes());
+        let cipher = Aes256Gcm::new(key);
+        use rand::RngCore;
+        let mut nonce_bytes = [0u8; 12];
+        let mut rng = rand::rng();
+        rng.fill_bytes(&mut nonce_bytes);
+        let nonce = GenericArray::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, data.as_bytes())
+            .map_err(|e| UploadError::Other(format!("Encryption failed: {}", e)))?;
+
+        // 组合nonce和密文
+        let mut combined = nonce_bytes.to_vec();
+        combined.extend_from_slice(&ciphertext);
+
+        // Base64编码
+        Ok(general_purpose::STANDARD.encode(&combined))
+    }
+    
+    // 解密数据
+    fn decrypt_data(encrypted_data: &str, password: &str) -> Result<String, UploadError> {
+        // 解码Base64
+        let combined = general_purpose::STANDARD.decode(encrypted_data)
+            .map_err(|e| UploadError::Other(format!("Base64 decode failed: {}", e)))?;
+        
+        // 分离nonce和密文
+        if combined.len() < 12 {
+            return Err(UploadError::Other("Invalid encrypted data".into()));
+        }
+        
+        let nonce = GenericArray::from_slice(&combined[0..12]);
+        let ciphertext = &combined[12..];
+        
+        // 使用AES-GCM解密
+        let key = GenericArray::from_slice(password.as_bytes());
+        let cipher = Aes256Gcm::new(key);
+        
+        let plaintext = cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| UploadError::Other(format!("Decryption failed: {}", e)))?;
+        
+        String::from_utf8(plaintext)
+            .map_err(|e| UploadError::Other(format!("UTF8 conversion failed: {}", e)))
+    }
 }
 
 #[tokio::main]
@@ -537,6 +706,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Upload {
             file_path,
             save_path,
+            encrypt,
         } => {
             let path = Path::new(&file_path);
             if !path.exists() {
@@ -553,9 +723,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match uploader.upload_file(path, &save_path).await {
                 Ok(urls) => {
-                    println!("\nUpload successful! URLs:");
-                    for url in &urls {
-                        println!("- {}", url);
+                    println!("\nUpload successful! Generating short text...");
+                    
+                    // 生成短文本
+                    let short_text = FileUploader::generate_short_text(&urls, &file_name, encrypt)?;
+                    
+                    if encrypt {
+                        // 提取密码
+                        let password = short_text.split('|').next().unwrap_or("")
+                            .strip_prefix("PASSWORD:").unwrap_or("");
+                        
+                        println!("\nEncrypted short text generated:");
+                        println!("Password: {}", password);
+                        println!("Short text: {}", short_text);
+                        println!("\nTo download, use:");
+                        println!("  program download-from-text --text \"{}\" --password {} --output-path <output-file>", short_text, password);
+                    } else {
+                        println!("\nShort text generated:");
+                        println!("{}", short_text);
+                        println!("\nTo download, use:");
+                        println!("  program download-from-text --text \"{}\" --output-path <output-file>", short_text);
                     }
 
                     let record = UploadRecord {
@@ -593,6 +780,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::History => {
             uploader.show_history()?;
+        }
+        Commands::DownloadFromText { text, password, output_path } => {
+            println!("Downloading from short text...");
+            uploader.download_from_short_text(&text, password.as_deref(), &output_path).await?;
+            println!("\nDownload completed: {}", output_path);
         }
     }
 
