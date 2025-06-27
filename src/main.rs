@@ -13,7 +13,7 @@ use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use futures_util::StreamExt;
 
-const CHUNK_SIZE: u64 = 40 * 1024 * 1024; // 40MB
+const CHUNK_SIZE: u64 = 15 * 1024 * 1024; // 15MB
 const HISTORY_FILE: &str = "upload_history.json";
 const CONFIG_FILE: &str = "config.json";
 const TIMEOUT_SECONDS: u64 = 120;
@@ -276,25 +276,63 @@ impl FileUploader {
             .await?;
 
         let status = response.status();
+        let response_text = response.text().await?;  // 获取原始响应文本
+
+        // 调试输出
+        println!("Upload response (status {}): {}", status, response_text);
+
         if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(UploadError::Other(format!(
                 "Upload failed with status: {}\n{}",
-                status,
-                error_text
+                status, response_text
             )));
         }
 
-        #[derive(Deserialize)]
-        struct PgaotUploadResponse {
-            url: String,
+        // 尝试解析响应
+        match serde_json::from_str::<serde_json::Value>(&response_text) {
+            Ok(json) => {
+                // 检查是否有"url"字段
+                if let Some(url) = json["url"].as_str() {
+                    return Ok(url.to_string());
+                }
+                
+                // 检查是否有"data"字段，其中包含"url"
+                if let Some(data) = json["data"].as_object() {
+                    if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
+                        return Ok(url.to_string());
+                    }
+                }
+                
+                // 检查是否有"path"字段
+                if let Some(path) = json["path"].as_str() {
+                    return Ok(format!("https://static.codemao.cn/{}", path));
+                }
+                
+                // 如果以上都没有，返回原始文本中的URL部分
+                Err(UploadError::Other(format!(
+                    "Unexpected response format: {}",
+                    response_text
+                )))
+            }
+            Err(_) => {
+                // 如果JSON解析失败，尝试从文本中提取URL
+                if let Some(start) = response_text.find("http://") {
+                    if let Some(end) = response_text[start..].find('"') {
+                        return Ok(response_text[start..start+end].to_string());
+                    }
+                }
+                if let Some(start) = response_text.find("https://") {
+                    if let Some(end) = response_text[start..].find('"') {
+                        return Ok(response_text[start..start+end].to_string());
+                    }
+                }
+                
+                Err(UploadError::Other(format!(
+                    "Failed to parse response: {}",
+                    response_text
+                )))
+            }
         }
-
-        let response_json: PgaotUploadResponse = response.json().await?;
-        Ok(response_json.url)
     }
 
     async fn split_and_upload(
@@ -305,6 +343,7 @@ impl FileUploader {
         let temp_dir = tempdir()?;
         let chunk_paths = self.create_chunks(file_path, temp_dir.path())?;
 
+        println!("Starting upload of {} chunks...", chunk_paths.len());
         let pb = ProgressBar::new(chunk_paths.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -315,13 +354,16 @@ impl FileUploader {
         );
 
         let mut urls = Vec::new();
-        for chunk in &chunk_paths {
+        for (index, chunk) in chunk_paths.iter().enumerate() {
+            println!("Uploading chunk {}/{}: {}", index + 1, chunk_paths.len(), chunk.display());
             let url = self.upload_to_pgaot(chunk, save_path).await?;
+            println!("  Chunk uploaded to: {}", url);
             urls.push(url);
             pb.inc(1);
         }
 
         pb.finish_with_message("Upload completed");
+        println!("All {} chunks uploaded successfully", urls.len());
         Ok(urls)
     }
 
@@ -367,22 +409,34 @@ impl FileUploader {
         let mut part = 1;
 
         loop {
+            // 正确的分块文件命名格式：文件名.7z.001, 文件名.7z.002, ...
             let chunk_name = format!("{}.7z.{:03}", file_stem, part);
-            let chunk_path = output_dir.join(chunk_name);
-
-            if !chunk_path.exists() {
+            let chunk_path = output_dir.join(&chunk_name);
+            
+            if chunk_path.exists() {
+                chunks.push(chunk_path);
+                part += 1;
+            } else {
+                // 当part=1时，可能没有分块，检查单个文件是否存在（未分割的情况）
                 if part == 1 {
-                    // 检查是否有单个文件（未分割）
-                    let single_file = output_dir.join(format!("{}.7z", file_stem));
-                    if single_file.exists() {
-                        chunks.push(single_file);
+                    let base_file = output_dir.join(format!("{}.7z", file_stem));
+                    if base_file.exists() {
+                        chunks.push(base_file);
                     }
                 }
                 break;
             }
+        }
 
-            chunks.push(chunk_path);
-            part += 1;
+        // 如果没有任何文件，返回错误
+        if chunks.is_empty() {
+            return Err(UploadError::SevenZipError("No chunks created".into()));
+        }
+
+        // 输出分块信息用于调试
+        println!("Created {} chunks:", chunks.len());
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("  Chunk {}: {}", i + 1, chunk.display());
         }
 
         Ok(chunks)
